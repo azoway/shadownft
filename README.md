@@ -1,0 +1,165 @@
+在 Linux 服务器上安装 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)，并用 nftables 做敲门加白。
+
+端口 B 跑 Shadowsocks。端口 A 不监听任何程序，只记录谁发过包。来源地址会拿去查 ip-api，属于重庆，或者 `mobile` 为 true，才把这个 IPv4 以 /32 放进白名单。白名单最多留最新 100 条。公网访问端口 B 必须先在白名单里。内网、SSH、已经建立的连接不需要敲门。
+
+## 服务器要求
+
+- x86_64 或 aarch64
+- systemd
+- root
+- apt 或 dnf
+- 能访问 GitHub，以及 `http://ip-api.com`
+- 云厂商安全组放行 SSH，再放行端口 A 和端口 B 的 TCP、UDP
+
+本机是 macOS 时只能检查脚本，不能在这里加载 nftables。安装要在服务器上执行。
+
+## 部署
+
+把仓库放到服务器上，执行：
+
+```bash
+sudo ./install.sh
+```
+
+安装过程会：
+
+1. 安装 `nftables`、`python3`、`curl`、`xz`
+2. 从 shadowsocks-rust 的 GitHub release 下载 `ssserver`，并核对 sha256
+3. 没有指定密码时，用 `ssservice genkey` 生成密钥
+4. 没有指定端口时，端口 B 在 10000–20000 之间随机，端口 A 是端口 B 加上 1 到 1000 的随机数
+5. 写入 nftables 表 `inet shadownft`，并启动 `shadowsocks-rust`、`shadownft` 两个服务
+
+第一次加载防火墙后有 60 秒回滚。现有 SSH 会话会保持。看到下面这句时，在同一个会话里执行：
+
+```bash
+sudo /usr/local/sbin/shadownft confirm
+```
+
+60 秒内没有确认，脚本会删掉 `inet shadownft`，并停止这两个服务。已经确认过的机器再次安装，不会再倒计时。
+
+装完后的连接信息在终端里，也写在 `/etc/shadownft/client.txt`，权限 600：
+
+```bash
+sudo cat /etc/shadownft/client.txt
+```
+
+内容是公网地址、加密方法、密码、端口 B、端口 A，以及一条 `ss://` 链接。
+
+客户端先向端口 A 发一个包，再连端口 B。端口 A 没有服务，TCP 超时或被拒绝是正常的。
+
+```bash
+nc -vz -w 3 服务器地址 端口A
+```
+
+UDP 也可以：
+
+```bash
+nc -uzv -w 3 服务器地址 端口A
+```
+
+等一两秒，再让 Shadowsocks 客户端连端口 B。可以看白名单和日志：
+
+```bash
+sudo nft list set inet shadownft whitelist
+sudo journalctl -u shadownft -n 50 --no-pager
+```
+
+ip-api 在中文结果里把重庆标成 region `CQ`、地区名「重庆市」。比较前会去掉末尾的「市」或「省」，所以默认名单里的 `CQ` 和「重庆」都能对上。`mobile` 为 true 的地址即使不在重庆也会加白。
+
+免费 ip-api 走 HTTP，每分钟 45 次，并且声明不用于商用。查询失败或对不上时不加白，已经在名单里的地址保留。要换成带密钥的 HTTPS，把 `IP_API_URL` 设成仍然包含 `{ip}` 的地址。
+
+2022 加密要求服务器和客户端的时钟差在 30 秒以内。安装时如果时钟还没同步，会尝试打开 `systemd-timesyncd`。
+
+默认加密是 `2022-blake3-aes-128-gcm`。密码是 16 字节密钥的 Base64，不是任意字符串。
+
+## 变量
+
+变量写在安装命令前面。`/etc/shadownft/config.env` 里已有的值会保留；这次命令里写出来的同名变量覆盖它们。
+
+```bash
+sudo SS_PORT=18000 SSH_PORT=22 PUBLIC_IP=203.0.113.10 ./install.sh
+```
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SS_METHOD` | `2022-blake3-aes-128-gcm` | 加密方法 |
+| `SS_PASSWORD` | 空则生成 | 设为 `generate` 时重新生成 |
+| `SS_PORT` | 10000–20000 间随机 | 端口 B |
+| `PORT_A` | 端口 B + 1..1000 | 敲门端口，不跑服务 |
+| `PORT_MIN` / `PORT_MAX` | `10000` / `20000` | 只约束随机出来的端口 B |
+| `PORT_A_OFFSET_MAX` | `1000` | 随机端口 A 的最大偏移 |
+| `SS_BIND` | `0.0.0.0` | Shadowsocks 监听地址 |
+| `SS_MODE` | `tcp_and_udp` | 也可设 `tcp_only` 或 `udp_only` |
+| `SS_VERSION` | 空则装当前最新 release，并记入配置 | `latest` 强制重新取最新版 |
+| `SSH_PORT` | 读 `sshd -T`，否则 `22` | 防火墙放行的 SSH 端口 |
+| `PUBLIC_IP` | 向 ip-api 查询 | 写进连接信息 |
+| `INTRANET_V4` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8` | 直接放行的 IPv4 |
+| `INTRANET_V6` | `::1,fc00::/7,fe80::/10` | 直接放行的 IPv6 |
+| `ALLOW_REGIONS` | `CQ,重庆` | 逗号分隔，对照 region、省份名、城市名 |
+| `ALLOW_MOBILE` | `true` | `mobile` 为 true 时加白 |
+| `WHITELIST_MAX` | `100` | 只保留最新的这些 /32 |
+| `WHITELIST_SCOPE` | `dport_b` | 目前只支持这个值：白名单只能访问端口 B |
+| `IP_API_URL` | `http://ip-api.com/json/{ip}?...&lang={lang}` | 必须包含 `{ip}` |
+| `IP_API_LANG` | `zh-CN` | 替换 URL 里的 `{lang}` |
+| `IP_API_RATE` | `40` | 每分钟最多查询这么多次 |
+| `KNOCK_COOLDOWN` | `600` | 不匹配的地址多少秒内不再查询 |
+| `NEGATIVE_TTL` | `600` | 查询失败后的冷却秒数 |
+| `QUEUE_MAX` | `50` | 排队中的敲门上限，满了就丢掉新的 |
+| `REPLACE_FIREWALL` | 空 | 设为 `1` 才关闭 ufw、firewalld，并停用系统 `nftables` 服务 |
+
+服务器上如果 ufw 或 firewalld 正在运行，系统 `nftables` 服务已启用，或者另有一条 input 链的策略是 drop，安装会停下来。确认要改掉它们时：
+
+```bash
+sudo REPLACE_FIREWALL=1 ./install.sh
+```
+
+停用之后如果还有别的 input drop 链，安装会中止，并且不会自动把 ufw 打开。
+
+命令行里传入的密码会出现在 shell 历史里。轮换密码用：
+
+```bash
+sudo SS_PASSWORD=generate ./install.sh
+```
+
+## 回滚
+
+手动撤掉这次加上的防火墙和服务，程序和配置还留着：
+
+```bash
+sudo /usr/local/sbin/shadownft rollback
+```
+
+这会停止并禁用 `shadowsocks-rust` 和 `shadownft`，删除 `inet shadownft`，并清掉确认标记。白名单文件 `/var/lib/shadownft/whitelist.order` 还在。下次安装会把它填回去。
+
+## 卸载
+
+```bash
+sudo /usr/local/sbin/shadownft uninstall
+```
+
+会删掉：
+
+- `shadowsocks-rust` 和 `shadownft` 服务
+- `inet shadownft`
+- `/etc/shadownft`、`/etc/shadowsocks-rust`、`/var/lib/shadownft`
+- `/usr/local/sbin/shadownft`
+- `/usr/local/lib/shadownft`
+- `/usr/local/bin/ssserver`、`/usr/local/bin/ssservice`
+- 系统用户 `shadowsocks`
+
+不会卸掉 `nftables`、`python3`、`curl`。`ufw` 和 `firewalld` 如果在安装时被关掉，也不会自动打开。需要的话自己执行 `sudo ufw enable`，或 `sudo systemctl enable --now firewalld`。
+
+服务文件已经不在时，可以手工做同样的事：
+
+```bash
+sudo systemctl disable --now shadownft shadowsocks-rust
+sudo nft delete table inet shadownft
+sudo rm -f /etc/systemd/system/shadownft.service /etc/systemd/system/shadowsocks-rust.service
+sudo systemctl daemon-reload
+sudo rm -rf /etc/shadownft /etc/shadowsocks-rust /var/lib/shadownft /usr/local/lib/shadownft
+sudo rm -f /usr/local/sbin/shadownft /usr/local/bin/ssserver /usr/local/bin/ssservice
+sudo userdel shadowsocks
+sudo groupdel shadowsocks
+```
+
+`nft delete` 或 `userdel` 提示不存在时，可以忽略。
