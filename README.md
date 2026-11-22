@@ -1,6 +1,6 @@
-在 Linux 服务器上安装 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)，并用 nftables 做敲门加白。
+在 Linux 服务器上用 nftables 做敲门加白。默认还会安装 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的服务端。生成的 `ss://` 链接不绑定这个项目的客户端，sing-box、Clash Meta、Shadowrocket、v2rayN、shadowsocks-rust，以及其他支持同一种加密的客户端都可以用。`INSTALL_PROXY=no` 时不安装代理，端口 B 上的程序自己准备。
 
-端口 B 跑 Shadowsocks。敲门端口不监听任何程序，只记录谁发过包。默认不查 ip-api，发包的 IPv4 直接写入本机白名单。`IP_API=yes` 时才查 ip-api，并且只有重庆或 `mobile` 为 true 才加白。白名单最多留最新 100 条。
+敲门端口不监听任何程序，只记录谁发过包。默认不查 ip-api，发包的 IPv4 直接写入本机白名单。`IP_API=yes` 时才查 ip-api，并且只有重庆或 `mobile` 为 true 才加白。白名单最多留最新 100 条。
 
 访问 SSH、80、443 这些默认放行端口，或者访问敲门端口、Shadowsocks 端口，不会被拉黑。先连 Shadowsocks 端口再去敲门，仍然可以加白。访问了这三类以外的 TCP 或 UDP 端口，会立刻移出白名单并进入黑名单，默认 24 小时内再敲门也不会加白。重复访问会重新计算这 24 小时。内网地址和已经建立的连接不触发拉黑。
 
@@ -18,7 +18,7 @@
 - root
 - apt 或 dnf
 - 能访问 GitHub，以及 `http://ip-api.com`
-- 云厂商安全组放行 SSH、80、443，再放行敲门端口和 Shadowsocks 端口的 TCP、UDP
+- 云厂商安全组放行 SSH、80、443，再放行敲门端口和端口 B 的 TCP、UDP
 
 ## 部署
 
@@ -27,6 +27,20 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | bash
 ```
+
+指定端口 A 和端口 B：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | PORT_A=14142 PORT_B=13511 bash
+```
+
+只安装防火墙、不安装代理。端口 A 和端口 B 必须给出，端口 B 上的服务需要自己安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | INSTALL_PROXY=no PORT_A=14142 PORT_B=13511 bash
+```
+
+`PORT_B` 和 `SS_PORT` 是同一个端口。两个都写了但数值不同，安装会退出。`INSTALL_PROXY` 会记入配置，之后重复执行保持这次的选择。已经装过代理时再改成 `INSTALL_PROXY=no`，脚本不再动原来的 `ssserver`，也不会把它卸掉。
 
 要在安装时关掉 ufw、firewalld 和系统自带的 nftables 服务，执行：
 
@@ -39,10 +53,9 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 安装过程会：
 
 1. 安装 `nftables`、`python3`、`curl`、`xz`
-2. 从 shadowsocks-rust 的 GitHub release 下载 `ssserver`，并核对 sha256
-3. 没有指定密码时，用 `ssservice genkey` 生成密钥
-4. 没有指定端口时，Shadowsocks 端口和敲门端口都在 10000–20000 之间随机。敲门端口默认 1 个
-5. 写入 nftables 表 `inet shadownft`，并启动 `shadowsocks-rust`、`shadownft` 两个服务
+2. `INSTALL_PROXY=yes` 时，从 shadowsocks-rust 的 GitHub release 下载 `ssserver`，并核对 sha256。没有指定密码时用 `ssservice genkey` 生成密钥
+3. 没有指定端口时，端口 B 和敲门端口都在 10000–20000 之间随机。敲门端口默认 1 个。`INSTALL_PROXY=no` 时不随机，必须传入 `PORT_A` 和 `PORT_B`
+4. 写入 nftables 表 `inet shadownft`，并启动 `shadownft`。安装代理时同时启动 `shadowsocks-rust`
 
 装完后的连接信息在终端里，也写在 `/etc/shadownft/client.txt`，权限 600：
 
@@ -50,9 +63,9 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 sudo cat /etc/shadownft/client.txt
 ```
 
-内容是公网地址、加密方法、密码、Shadowsocks 端口、敲门端口，以及一条 `ss://` 链接。
+安装了代理时，内容包括公网地址、加密方法、密码、端口 B、敲门端口，以及一条 `ss://` 链接。这条链接交给支持 `2022-blake3-aes-128-gcm` 的客户端即可。不安装代理时，文件里只有公网地址、端口 A 和端口 B。
 
-客户端先向任一敲门端口发一个包，再连 Shadowsocks 端口。敲门端口没有服务，TCP 超时或被拒绝是正常的。
+客户端或你自己的程序先向任一敲门端口发一个包，再连端口 B。敲门端口没有服务，TCP 超时或被拒绝是正常的。
 
 ```bash
 nc -vz -w 3 服务器地址 端口A
@@ -64,7 +77,7 @@ UDP 也可以：
 nc -uzv -w 3 服务器地址 端口A
 ```
 
-等一两秒，再让 Shadowsocks 客户端连端口 B。可以看白名单和日志：
+等一两秒，再连接端口 B。可以看白名单和日志：
 
 ```bash
 sudo nft list set inet shadownft whitelist
@@ -95,7 +108,9 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 |---|---|---|
 | `SS_METHOD` | `2022-blake3-aes-128-gcm` | 加密方法 |
 | `SS_PASSWORD` | 空则生成 | 设为 `generate` 时重新生成 |
-| `SS_PORT` | 10000–20000 间随机 | Shadowsocks 端口 |
+| `INSTALL_PROXY` | `yes` | `no` 时不下载、不安装、不启动代理 |
+| `SS_PORT` / `PORT_B` | 10000–20000 间随机 | 受白名单保护的端口。安装代理时这是 Shadowsocks 端口 |
+| `PORT_A` | 空则随机一个敲门端口 | 指定单个敲门端口。`INSTALL_PROXY=no` 时必填 |
 | `KNOCK_COUNT` | `1` | 敲门端口个数，在 10000–20000 间随机 |
 | `KNOCK_PORTS` | 空则按个数随机 | 逗号分隔。已有旧的 `PORT_A` 时继续用它。设为 `generate` 会按个数重抽 |
 | `PORT_MIN` / `PORT_MAX` | `10000` / `20000` | 随机端口的范围 |
@@ -103,7 +118,7 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 | `SS_MODE` | `tcp_and_udp` | 也可设 `tcp_only` 或 `udp_only` |
 | `SS_VERSION` | 空则装当前最新 release，并记入配置 | `latest` 强制重新取最新版 |
 | `SSH_PORT` | 读 `sshd -T`，否则 `22` | 用来避开端口 A、B，并作为默认额外放行端口之一 |
-| `ALLOW_PORTS` | SSH 端口、`80`、`443` | 这些端口的 TCP 和 UDP 对所有来源放行。访问清单以外、且不是敲门或 Shadowsocks 的端口，会拉黑 |
+| `ALLOW_PORTS` | SSH 端口、`80`、`443` | 这些端口的 TCP 和 UDP 对所有来源放行。访问清单以外、且不是敲门端口或端口 B 的端口，会拉黑 |
 | `PUBLIC_IP` | 向 ip-api 查询 | 写进连接信息 |
 | `INTRANET_V4` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8` | 直接放行的 IPv4 |
 | `INTRANET_V6` | `::1,fc00::/7,fe80::/10` | 直接放行的 IPv6 |

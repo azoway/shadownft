@@ -24,8 +24,9 @@ usage() {
   cat <<'EOF'
 用法:
   curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | bash
+  PORT_A=14142 PORT_B=13511 bash /usr/local/sbin/shadownft
+  INSTALL_PROXY=no PORT_A=14142 PORT_B=13511 bash /usr/local/sbin/shadownft
   confirm=yes bash /usr/local/sbin/shadownft
-  ALLOW_PORTS=22,80,443,8443 bash /usr/local/sbin/shadownft
   /usr/local/sbin/shadownft rollback
   /usr/local/sbin/shadownft uninstall
 
@@ -385,6 +386,14 @@ PY
     ALLOW_PORTS="${SSH_PORT},80,443"
   fi
   ALLOW_PORTS=$("$PYTHON" "$PY" --normalize-allow-ports | tr -d '[:space:]')
+  if [ "${INSTALL_PROXY}" = "no" ]; then
+    if [ -z "${SS_PORT}" ]; then
+      die "INSTALL_PROXY=no 时需要指定 PORT_B"
+    fi
+    if [ -z "${PORT_A}" ] && { [ -z "${KNOCK_PORTS}" ] || [ "${KNOCK_PORTS}" = "generate" ]; }; then
+      die "INSTALL_PROXY=no 时需要指定 PORT_A"
+    fi
+  fi
   ports=$("$PYTHON" "$PY" --choose-ports)
   SS_PORT=$(printf '%s\n' "$ports" | awk 'NR==1 {print; exit}')
   KNOCK_PORTS=$(printf '%s\n' "$ports" | awk 'NR==2 {print; exit}')
@@ -393,34 +402,40 @@ PY
     die "没有得到 Shadowsocks 端口或敲门端口"
   fi
 
-  version=$(download_shadowsocks "${SS_VERSION:-}")
-  SS_VERSION=$version
-  if [ -z "${SS_PASSWORD:-}" ] || [ "$SS_PASSWORD" = "generate" ]; then
-    SS_PASSWORD=$("$SSSERVICE" genkey -m "$SS_METHOD" | tr -d '[:space:]')
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    version=$(download_shadowsocks "${SS_VERSION:-}")
+    SS_VERSION=$version
+    if [ -z "${SS_PASSWORD:-}" ] || [ "$SS_PASSWORD" = "generate" ]; then
+      SS_PASSWORD=$("$SSSERVICE" genkey -m "$SS_METHOD" | tr -d '[:space:]')
+    fi
+    "$PYTHON" "$PY" --check-password
   fi
-  "$PYTHON" "$PY" --check-password
   detect_public_ip
 
-  if command -v timedatectl >/dev/null 2>&1; then
+  if [ "${INSTALL_PROXY}" = "yes" ] && command -v timedatectl >/dev/null 2>&1; then
     if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" != "yes" ]; then
       systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
       printf '%s\n' "时钟尚未显示已同步。2022 加密要求两端误差在 30 秒以内。"
     fi
   fi
 
-  ensure_user
-  chown root:shadowsocks "$SS_DIR"
-  chmod 750 "$SS_DIR"
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    ensure_user
+    chown root:shadowsocks "$SS_DIR"
+    chmod 750 "$SS_DIR"
+  fi
   "$PYTHON" "$PY" --write-env "$CONFIG_ENV"
   "$PYTHON" "$PY" --render-nft >"$NFT_FILE"
   "$PYTHON" "$PY" --render-rules >"$NFT_RULES"
   chmod 644 "$NFT_FILE" "$NFT_RULES"
-  "$PYTHON" "$PY" --write-ss-config "$SS_CONFIG"
-  chown root:shadowsocks "$SS_CONFIG"
-  chmod 640 "$SS_CONFIG"
-  if command -v su >/dev/null 2>&1; then
-    if ! su -s /bin/sh shadowsocks -c "test -r '$SS_CONFIG'"; then
-      die "shadowsocks 用户读不到 $SS_CONFIG"
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    "$PYTHON" "$PY" --write-ss-config "$SS_CONFIG"
+    chown root:shadowsocks "$SS_CONFIG"
+    chmod 640 "$SS_CONFIG"
+    if command -v su >/dev/null 2>&1; then
+      if ! su -s /bin/sh shadowsocks -c "test -r '$SS_CONFIG'"; then
+        die "shadowsocks 用户读不到 $SS_CONFIG"
+      fi
     fi
   fi
   "$PYTHON" "$PY" --write-client "$CLIENT_TXT" >"$tmp/client.txt"
@@ -430,7 +445,8 @@ PY
   if readlink -f "$PYTHON" >/dev/null 2>&1; then
     pybin=$(readlink -f "$PYTHON")
   fi
-  cat > /etc/systemd/system/shadowsocks-rust.service <<'EOF'
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    cat > /etc/systemd/system/shadowsocks-rust.service <<'EOF'
 [Unit]
 Description=Shadowsocks-rust server
 After=network-online.target
@@ -452,11 +468,20 @@ LimitNOFILE=51200
 [Install]
 WantedBy=multi-user.target
 EOF
+    chmod 644 /etc/systemd/system/shadowsocks-rust.service
+  fi
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    watcher_after="After=network-online.target shadowsocks-rust.service"
+    watcher_wants="Wants=network-online.target shadowsocks-rust.service"
+  else
+    watcher_after="After=network-online.target"
+    watcher_wants="Wants=network-online.target"
+  fi
   cat > /etc/systemd/system/shadownft.service <<EOF
 [Unit]
 Description=shadownft knock watcher
-After=network-online.target shadowsocks-rust.service
-Wants=network-online.target shadowsocks-rust.service
+${watcher_after}
+${watcher_wants}
 
 [Service]
 Type=simple
@@ -470,10 +495,12 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 644 /etc/systemd/system/shadowsocks-rust.service /etc/systemd/system/shadownft.service
+  chmod 644 /etc/systemd/system/shadownft.service
 
   systemctl daemon-reload
-  systemctl enable shadowsocks-rust
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    systemctl enable shadowsocks-rust
+  fi
   systemctl enable shadownft
 
   dump_ruleset "$ruleset"
@@ -485,9 +512,11 @@ EOF
     fi
   fi
 
-  systemctl restart shadowsocks-rust
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    systemctl restart shadowsocks-rust
+  fi
   systemctl restart shadownft
-  if ! systemctl is-active --quiet shadowsocks-rust; then
+  if [ "${INSTALL_PROXY}" = "yes" ] && ! systemctl is-active --quiet shadowsocks-rust; then
     journalctl -u shadowsocks-rust -n 40 --no-pager || true
     die "shadowsocks-rust 没有运行"
   fi
@@ -495,7 +524,7 @@ EOF
     journalctl -u shadownft -n 40 --no-pager || true
     die "shadownft 没有运行"
   fi
-  if command -v ss >/dev/null 2>&1; then
+  if [ "${INSTALL_PROXY}" = "yes" ] && command -v ss >/dev/null 2>&1; then
     if ! ss -lntu | grep -E ":${SS_PORT}([^0-9]|\$)" >/dev/null; then
       die "ssserver 没有监听 ${SS_PORT}"
     fi
@@ -505,6 +534,11 @@ EOF
   cat "$CLIENT_TXT"
   printf '%s\n' "敲门端口: ${KNOCK_PORTS}"
   printf '%s\n' "额外放行端口: ${ALLOW_PORTS}"
+  if [ "${INSTALL_PROXY}" = "yes" ]; then
+    printf '%s\n' "ss:// 链接可用于 sing-box、Clash Meta、Shadowrocket、v2rayN、shadowsocks-rust，以及其他支持该方法的客户端。"
+  else
+    printf '%s\n' "未安装代理。端口 B 上的程序需要自行提供。"
+  fi
   if [ "${IP_API:-no}" = "yes" ]; then
     printf '%s\n' "敲门后会查询 ip-api，只有重庆或移动网络才加白。"
   else

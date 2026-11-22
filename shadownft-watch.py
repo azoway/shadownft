@@ -28,7 +28,9 @@ DEFAULTS = {
     "SS_METHOD": "2022-blake3-aes-128-gcm",
     "SS_PASSWORD": "",
     "SS_PORT": "",
+    "PORT_B": "",
     "PORT_A": "",
+    "INSTALL_PROXY": "yes",
     "KNOCK_PORTS": "",
     "KNOCK_COUNT": "1",
     "SS_BIND": "0.0.0.0",
@@ -159,9 +161,19 @@ def resolve_settings(explicit, file_text):
     require_int(merged["BLACKLIST_TIMEOUT"], "BLACKLIST_TIMEOUT", 1, 31536000)
     require_int(merged["BLACKLIST_MAX"], "BLACKLIST_MAX", 1, 65535)
     merged["IP_API"] = "yes" if env_bool(merged["IP_API"], "IP_API") else "no"
+    merged["INSTALL_PROXY"] = "yes" if env_bool(merged["INSTALL_PROXY"], "INSTALL_PROXY") else "no"
+    port_b = merged.get("PORT_B", "").strip()
+    ss_port = merged.get("SS_PORT", "").strip()
+    if port_b and ss_port and port_b != ss_port:
+        raise CommandError("PORT_B 和 SS_PORT 不一致")
+    if port_b:
+        merged["SS_PORT"] = port_b
+        merged["PORT_B"] = port_b
+    elif ss_port:
+        merged["PORT_B"] = ss_port
     if merged["KNOCK_PORTS"] and merged["KNOCK_PORTS"] != "generate":
         parse_port_list(merged["KNOCK_PORTS"], "KNOCK_PORTS")
-    for key in ("SSH_PORT", "SS_PORT", "PORT_A"):
+    for key in ("SSH_PORT", "SS_PORT", "PORT_A", "PORT_B"):
         if merged[key] != "":
             require_int(merged[key], key, 1, 65535)
     if merged["WHITELIST_SCOPE"] != "dport_b":
@@ -563,19 +575,29 @@ def ss_uri(method, password, host, port):
     return "ss://%s@%s:%s" % (token, host, port)
 
 
+def proxy_enabled(settings):
+    return env_bool(settings.get("INSTALL_PROXY", "yes"), "INSTALL_PROXY")
+
+
 def client_text(settings):
-    return "\n".join(
-        [
-            "server: %s" % settings["PUBLIC_IP"],
-            "method: %s" % settings["SS_METHOD"],
-            "password: %s" % settings["SS_PASSWORD"],
-            "port_b: %s" % settings["SS_PORT"],
-            "knock_ports: %s" % ",".join(str(port) for port in knock_ports_from_settings(settings)),
-            "port_a: %s" % knock_ports_from_settings(settings)[0],
-            ss_uri(settings["SS_METHOD"], settings["SS_PASSWORD"], settings["PUBLIC_IP"], settings["SS_PORT"]),
-            "",
-        ]
-    )
+    knocks = knock_ports_from_settings(settings)
+    lines = [
+        "server: %s" % settings["PUBLIC_IP"],
+        "port_b: %s" % settings["SS_PORT"],
+        "knock_ports: %s" % ",".join(str(port) for port in knocks),
+        "port_a: %s" % knocks[0],
+    ]
+    if proxy_enabled(settings):
+        lines.extend(
+            [
+                "method: %s" % settings["SS_METHOD"],
+                "password: %s" % settings["SS_PASSWORD"],
+                ss_uri(settings["SS_METHOD"], settings["SS_PASSWORD"], settings["PUBLIC_IP"], settings["SS_PORT"]),
+                "clients: sing-box, Clash Meta, Shadowrocket, v2rayN, shadowsocks-rust, or any client that supports this method",
+            ]
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def ss_config(settings):
@@ -1084,11 +1106,14 @@ def cmd_write_shell(path):
 
 
 def require_ready(settings):
-    for key in ("SS_PORT", "SSH_PORT", "SS_PASSWORD", "PUBLIC_IP"):
+    for key in ("SS_PORT", "SSH_PORT", "PUBLIC_IP"):
         if not str(settings.get(key, "")).strip():
             raise CommandError("%s 还是空的" % key)
     knock_ports_from_settings(settings)
-    check_password(settings["SS_METHOD"], settings["SS_PASSWORD"])
+    if proxy_enabled(settings):
+        if not str(settings.get("SS_PASSWORD", "")).strip():
+            raise CommandError("SS_PASSWORD 还是空的")
+        check_password(settings["SS_METHOD"], settings["SS_PASSWORD"])
 
 
 def fail(exc):
@@ -1154,7 +1179,26 @@ def run_self_test():
     except CommandError:
         pass
 
+    assert fresh["INSTALL_PROXY"] == "yes"
     assert fresh["IP_API"] == "no"
+    synced = resolve_settings({"PORT_B": "13511", "PORT_A": "14142"}, "")
+    assert synced["SS_PORT"] == "13511" and synced["PORT_B"] == "13511"
+    try:
+        resolve_settings({"PORT_B": "13511", "SS_PORT": "13512"}, "")
+        raise AssertionError("PORT_B and SS_PORT should match")
+    except CommandError:
+        pass
+    no_proxy = dict(synced)
+    no_proxy.update({"INSTALL_PROXY": "no", "SSH_PORT": "22", "PUBLIC_IP": "203.0.113.10", "SS_PASSWORD": ""})
+    no_proxy_text = client_text(no_proxy)
+    assert "ss://" not in no_proxy_text
+    assert "port_b: 13511" in no_proxy_text
+    assert "port_a: 14142" in no_proxy_text
+    with_proxy = dict(no_proxy)
+    with_proxy.update({"INSTALL_PROXY": "yes", "SS_PASSWORD": "x", "SS_METHOD": "2022-blake3-aes-128-gcm"})
+    with_proxy_text = client_text(with_proxy)
+    assert "ss://" in with_proxy_text
+    assert "sing-box" in with_proxy_text
     assert fresh["KNOCK_COUNT"] == "1"
     assert fresh["BLACKLIST_TIMEOUT"] == "86400"
     port_b, knocks = choose_service_ports("", "", "", "2", 22, "22,80,443", 20000, 20010, random.Random(1))
