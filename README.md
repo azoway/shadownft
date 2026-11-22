@@ -1,6 +1,8 @@
 在 Linux 服务器上安装 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)，并用 nftables 做敲门加白。
 
-端口 B 跑 Shadowsocks。端口 A 不监听任何程序，只记录谁发过包。来源地址会拿去查 ip-api，属于重庆，或者 `mobile` 为 true，才把这个 IPv4 以 /32 放进白名单。白名单最多留最新 100 条。公网访问端口 B 必须先在白名单里。内网、已经建立的连接，以及额外放行端口不需要敲门。额外放行端口默认是这台机器的 SSH 端口、80 和 443，和端口 A、端口 B 无关。
+端口 B 跑 Shadowsocks。敲门端口不监听任何程序，只记录谁发过包。默认不查 ip-api，发包的 IPv4 直接写入本机白名单。`IP_API=yes` 时才查 ip-api，并且只有重庆或 `mobile` 为 true 才加白。白名单最多留最新 100 条。
+
+访问 SSH、80、443 这些默认放行端口，或者访问敲门端口、Shadowsocks 端口，不会被拉黑。先连 Shadowsocks 端口再去敲门，仍然可以加白。访问了这三类以外的 TCP 或 UDP 端口，会立刻移出白名单并进入黑名单，默认 24 小时内再敲门也不会加白。重复访问会重新计算这 24 小时。内网地址和已经建立的连接不触发拉黑。
 
 ## 服务器要求
 
@@ -9,7 +11,7 @@
 - root
 - apt 或 dnf
 - 能访问 GitHub，以及 `http://ip-api.com`
-- 云厂商安全组放行 SSH、80、443，再放行端口 A 和端口 B 的 TCP、UDP
+- 云厂商安全组放行 SSH、80、443，再放行敲门端口和 Shadowsocks 端口的 TCP、UDP
 
 ## 部署
 
@@ -32,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 1. 安装 `nftables`、`python3`、`curl`、`xz`
 2. 从 shadowsocks-rust 的 GitHub release 下载 `ssserver`，并核对 sha256
 3. 没有指定密码时，用 `ssservice genkey` 生成密钥
-4. 没有指定端口时，端口 B 在 10000–20000 之间随机，端口 A 是端口 B 加上 1 到 1000 的随机数
+4. 没有指定端口时，Shadowsocks 端口和敲门端口都在 10000–20000 之间随机。敲门端口默认 1 个
 5. 写入 nftables 表 `inet shadownft`，并启动 `shadowsocks-rust`、`shadownft` 两个服务
 
 装完后的连接信息在终端里，也写在 `/etc/shadownft/client.txt`，权限 600：
@@ -41,9 +43,9 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 sudo cat /etc/shadownft/client.txt
 ```
 
-内容是公网地址、加密方法、密码、端口 B、端口 A，以及一条 `ss://` 链接。
+内容是公网地址、加密方法、密码、Shadowsocks 端口、敲门端口，以及一条 `ss://` 链接。
 
-客户端先向端口 A 发一个包，再连端口 B。端口 A 没有服务，TCP 超时或被拒绝是正常的。
+客户端先向任一敲门端口发一个包，再连 Shadowsocks 端口。敲门端口没有服务，TCP 超时或被拒绝是正常的。
 
 ```bash
 nc -vz -w 3 服务器地址 端口A
@@ -62,9 +64,13 @@ sudo nft list set inet shadownft whitelist
 sudo journalctl -u shadownft -n 50 --no-pager
 ```
 
-ip-api 在中文结果里把重庆标成 region `CQ`、地区名「重庆市」。比较前会去掉末尾的「市」或「省」，所以默认名单里的 `CQ` 和「重庆」都能对上。`mobile` 为 true 的地址即使不在重庆也会加白。
+默认 `IP_API=no`。要按归属地筛选时：
 
-免费 ip-api 走 HTTP，每分钟 45 次，并且声明不用于商用。查询失败或对不上时不加白，已经在名单里的地址保留。要换成带密钥的 HTTPS，把 `IP_API_URL` 设成仍然包含 `{ip}` 的地址。
+```bash
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | IP_API=yes bash
+```
+
+ip-api 在中文结果里把重庆标成 region `CQ`、地区名「重庆市」。比较前会去掉末尾的「市」或「省」，所以 `CQ` 和「重庆」都能对上。`mobile` 为 true 的地址即使不在重庆也会加白。免费接口走 HTTP，每分钟 45 次，并且声明不用于商用。查询失败或对不上时不加白。要换成带密钥的 HTTPS，把 `IP_API_URL` 设成仍然包含 `{ip}` 的地址。
 
 2022 加密要求服务器和客户端的时钟差在 30 秒以内。安装时如果时钟还没同步，会尝试打开 `systemd-timesyncd`。
 
@@ -82,20 +88,22 @@ curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | 
 |---|---|---|
 | `SS_METHOD` | `2022-blake3-aes-128-gcm` | 加密方法 |
 | `SS_PASSWORD` | 空则生成 | 设为 `generate` 时重新生成 |
-| `SS_PORT` | 10000–20000 间随机 | 端口 B |
-| `PORT_A` | 端口 B + 1..1000 | 敲门端口，不跑服务 |
-| `PORT_MIN` / `PORT_MAX` | `10000` / `20000` | 只约束随机出来的端口 B |
-| `PORT_A_OFFSET_MAX` | `1000` | 随机端口 A 的最大偏移 |
+| `SS_PORT` | 10000–20000 间随机 | Shadowsocks 端口 |
+| `KNOCK_COUNT` | `1` | 敲门端口个数，在 10000–20000 间随机 |
+| `KNOCK_PORTS` | 空则按个数随机 | 逗号分隔。已有旧的 `PORT_A` 时继续用它。设为 `generate` 会按个数重抽 |
+| `PORT_MIN` / `PORT_MAX` | `10000` / `20000` | 随机端口的范围 |
 | `SS_BIND` | `0.0.0.0` | Shadowsocks 监听地址 |
 | `SS_MODE` | `tcp_and_udp` | 也可设 `tcp_only` 或 `udp_only` |
 | `SS_VERSION` | 空则装当前最新 release，并记入配置 | `latest` 强制重新取最新版 |
 | `SSH_PORT` | 读 `sshd -T`，否则 `22` | 用来避开端口 A、B，并作为默认额外放行端口之一 |
-| `ALLOW_PORTS` | SSH 端口、`80`、`443` | 这些 TCP 端口对所有来源放行，逗号分隔。和敲门、白名单无关 |
+| `ALLOW_PORTS` | SSH 端口、`80`、`443` | 这些端口的 TCP 和 UDP 对所有来源放行。访问清单以外、且不是敲门或 Shadowsocks 的端口，会拉黑 |
 | `PUBLIC_IP` | 向 ip-api 查询 | 写进连接信息 |
 | `INTRANET_V4` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8` | 直接放行的 IPv4 |
 | `INTRANET_V6` | `::1,fc00::/7,fe80::/10` | 直接放行的 IPv6 |
-| `ALLOW_REGIONS` | `CQ,重庆` | 逗号分隔，对照 region、省份名、城市名 |
-| `ALLOW_MOBILE` | `true` | `mobile` 为 true 时加白 |
+| `IP_API` | `no` | `yes` 时敲门后才查 ip-api |
+| `ALLOW_REGIONS` | `CQ,重庆` | 只在 `IP_API=yes` 时使用 |
+| `ALLOW_MOBILE` | `true` | 只在 `IP_API=yes` 时，`mobile` 为 true 也加白 |
+| `BLACKLIST_TIMEOUT` | `86400` | 黑名单秒数，默认 24 小时 |
 | `WHITELIST_MAX` | `100` | 只保留最新的这些 /32 |
 | `WHITELIST_SCOPE` | `dport_b` | 目前只支持这个值：白名单只能访问端口 B |
 | `IP_API_URL` | `http://ip-api.com/json/{ip}?...&lang={lang}` | 必须包含 `{ip}` |

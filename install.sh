@@ -258,7 +258,7 @@ ensure_user() {
 }
 
 cmd_load_nft() {
-  local nft_bin size
+  local nft_bin
   nft_bin=$(find_nft)
   if [ ! -f "$NFT_FILE" ]; then
     die "没有 $NFT_FILE"
@@ -267,18 +267,10 @@ cmd_load_nft() {
     "$nft_bin" -f "$NFT_FILE"
     return 0
   fi
-  if ! "$nft_bin" list set inet shadownft whitelist >/dev/null 2>&1; then
-    size=$(awk '/^[[:space:]]*size / {print $2; exit}' "$NFT_FILE")
-    if [ -z "$size" ]; then
-      size=100
-    fi
-    "$nft_bin" add set inet shadownft whitelist "{ type ipv4_addr; size ${size}; }"
+  if [ ! -f "$PY_INSTALLED" ]; then
+    die "没有 $PY_INSTALLED"
   fi
-  "$nft_bin" add chain inet shadownft input '{ type filter hook input priority 0; policy drop; }' >/dev/null 2>&1 || true
-  if [ ! -f "$NFT_RULES" ]; then
-    die "没有 $NFT_RULES"
-  fi
-  "$nft_bin" -f "$NFT_RULES"
+  python3 "$PY_INSTALLED" --apply-rules
 }
 
 cmd_confirm() {
@@ -395,9 +387,10 @@ PY
   ALLOW_PORTS=$("$PYTHON" "$PY" --normalize-allow-ports | tr -d '[:space:]')
   ports=$("$PYTHON" "$PY" --choose-ports)
   SS_PORT=$(printf '%s\n' "$ports" | awk 'NR==1 {print; exit}')
-  PORT_A=$(printf '%s\n' "$ports" | awk 'NR==2 {print; exit}')
-  if [ -z "$SS_PORT" ] || [ -z "$PORT_A" ]; then
-    die "没有得到端口 A 或端口 B"
+  KNOCK_PORTS=$(printf '%s\n' "$ports" | awk 'NR==2 {print; exit}')
+  PORT_A=${KNOCK_PORTS%%,*}
+  if [ -z "$SS_PORT" ] || [ -z "$KNOCK_PORTS" ] || [ -z "$PORT_A" ]; then
+    die "没有得到 Shadowsocks 端口或敲门端口"
   fi
 
   version=$(download_shadowsocks "${SS_VERSION:-}")
@@ -510,7 +503,13 @@ EOF
 
   printf '\n'
   cat "$CLIENT_TXT"
+  printf '%s\n' "敲门端口: ${KNOCK_PORTS}"
   printf '%s\n' "额外放行端口: ${ALLOW_PORTS}"
+  if [ "${IP_API:-no}" = "yes" ]; then
+    printf '%s\n' "敲门后会查询 ip-api，只有重庆或移动网络才加白。"
+  else
+    printf '%s\n' "敲门后按本机记录加白，不查询 ip-api。"
+  fi
   if [ "$clean_now" -eq 1 ]; then
     printf '%s\n' "已按确认关闭 ufw、firewalld 和系统 nftables 服务。"
   else

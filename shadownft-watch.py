@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Knock watcher and install helpers for shadownft.
 
-Port A is never bound. nftables logs IPv4 packets to that port, this process
-reads them from /dev/kmsg, asks ip-api, and inserts matching addresses into
-the nftables whitelist. The set keeps the newest 100 addresses by default.
+Knock ports are never bound. nftables logs packets to those ports and drops
+packets to any other unexpected port into a blacklist. This process records
+the whitelist and blacklist, and queries ip-api only when IP_API=yes.
 """
 
 import base64
@@ -29,6 +29,8 @@ DEFAULTS = {
     "SS_PASSWORD": "",
     "SS_PORT": "",
     "PORT_A": "",
+    "KNOCK_PORTS": "",
+    "KNOCK_COUNT": "1",
     "SS_BIND": "0.0.0.0",
     "SS_MODE": "tcp_and_udp",
     "SS_VERSION": "",
@@ -40,6 +42,9 @@ DEFAULTS = {
     "ALLOW_MOBILE": "true",
     "WHITELIST_MAX": "100",
     "WHITELIST_SCOPE": "dport_b",
+    "IP_API": "no",
+    "BLACKLIST_TIMEOUT": "86400",
+    "BLACKLIST_MAX": "10000",
     "IP_API_URL": (
         "http://ip-api.com/json/{ip}"
         "?fields=status,message,query,region,regionName,city,mobile&lang={lang}"
@@ -66,6 +71,8 @@ KEY_LEN = {
 MODES = {"tcp_only", "udp_only", "tcp_and_udp"}
 ENV_PATH = "/etc/shadownft/config.env"
 ORDER_PATH = "/var/lib/shadownft/whitelist.order"
+BLACKLIST_PATH = "/var/lib/shadownft/blacklist.txt"
+BAN_PREFIX = "shadownft-ban "
 NFT_FAMILY = "inet"
 NFT_TABLE = "shadownft"
 LOG_PREFIX = "shadownft "
@@ -89,13 +96,13 @@ def split_csv(value):
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
-def env_bool(value):
+def env_bool(value, name="布尔值"):
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "on"}:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    raise CommandError("ALLOW_MOBILE 只能是 true 或 false")
+    raise CommandError("%s 只能是 yes 或 no" % name)
 
 
 def parse_env_text(text):
@@ -136,6 +143,9 @@ def resolve_settings(explicit, file_text):
         "PORT_MAX",
         "PORT_A_OFFSET_MAX",
         "QUEUE_MAX",
+        "KNOCK_COUNT",
+        "BLACKLIST_TIMEOUT",
+        "BLACKLIST_MAX",
     ):
         require_int(merged[key], key, 1, 1000000)
     port_min = require_int(merged["PORT_MIN"], "PORT_MIN", 1, 65535)
@@ -145,6 +155,12 @@ def resolve_settings(explicit, file_text):
     require_int(merged["PORT_A_OFFSET_MAX"], "PORT_A_OFFSET_MAX", 1, 65535)
     require_int(merged["WHITELIST_MAX"], "WHITELIST_MAX", 1, 65535)
     require_int(merged["QUEUE_MAX"], "QUEUE_MAX", 1, 10000)
+    require_int(merged["KNOCK_COUNT"], "KNOCK_COUNT", 1, 100)
+    require_int(merged["BLACKLIST_TIMEOUT"], "BLACKLIST_TIMEOUT", 1, 31536000)
+    require_int(merged["BLACKLIST_MAX"], "BLACKLIST_MAX", 1, 65535)
+    merged["IP_API"] = "yes" if env_bool(merged["IP_API"], "IP_API") else "no"
+    if merged["KNOCK_PORTS"] and merged["KNOCK_PORTS"] != "generate":
+        parse_port_list(merged["KNOCK_PORTS"], "KNOCK_PORTS")
     for key in ("SSH_PORT", "SS_PORT", "PORT_A"):
         if merged[key] != "":
             require_int(merged[key], key, 1, 65535)
@@ -172,6 +188,18 @@ def resolve_settings(explicit, file_text):
     return merged
 
 
+def parse_port_list(value, name):
+    ports = []
+    seen = set()
+    for part in split_csv(value):
+        port = require_int(part, name, 1, 65535)
+        if port in seen:
+            continue
+        seen.add(port)
+        ports.append(port)
+    return ports
+
+
 def parse_allow_ports(value, ssh_port):
     raw = str(value or "").strip()
     if raw:
@@ -191,37 +219,38 @@ def parse_allow_ports(value, ssh_port):
     return ports
 
 
-def choose_ports(ss_port, port_a, ssh_port, port_min, port_max, offset_max, rng, allow_ports=""):
-    ssh_port = int(ssh_port)
+def choose_service_ports(ss_port, knock_spec, legacy_port, knock_count, ssh_port, allow_ports, port_min, port_max, rng):
     port_min = int(port_min)
     port_max = int(port_max)
-    offset_max = int(offset_max)
     open_ports = set(parse_allow_ports(allow_ports, ssh_port))
     if ss_port in ("", None):
         pool = [port for port in range(port_min, port_max + 1) if port not in open_ports]
         if not pool:
-            raise CommandError("随机范围内没有可用的端口 B")
+            raise CommandError("随机范围内没有可用的 Shadowsocks 端口")
         ss_port = rng.choice(pool)
     else:
         ss_port = require_int(ss_port, "SS_PORT", 1, 65535)
         if ss_port in open_ports:
-            raise CommandError("端口 B 与额外放行端口相同")
-    if port_a in ("", None):
-        pool = []
-        for offset in range(1, offset_max + 1):
-            candidate = ss_port + offset
-            if candidate > 65535:
-                break
-            if candidate != ss_port and candidate not in open_ports:
-                pool.append(candidate)
-        if not pool:
-            raise CommandError("端口 B 太大，无法再加 1 到 %s 得到端口 A" % offset_max)
-        port_a = rng.choice(pool)
+            raise CommandError("Shadowsocks 端口与额外放行端口相同")
+    spec = str(knock_spec or "").strip()
+    legacy = str(legacy_port or "").strip()
+    if spec == "generate":
+        spec = ""
+        legacy = ""
+    if spec:
+        knocks = parse_port_list(spec, "KNOCK_PORTS")
+    elif legacy:
+        knocks = [require_int(legacy, "PORT_A", 1, 65535)]
     else:
-        port_a = require_int(port_a, "PORT_A", 1, 65535)
-        if port_a == ss_port or port_a in open_ports:
-            raise CommandError("端口 A 与端口 B 或额外放行端口相同")
-    return ss_port, port_a
+        count = require_int(knock_count, "KNOCK_COUNT", 1, 100)
+        pool = [port for port in range(port_min, port_max + 1) if port != ss_port and port not in open_ports]
+        if len(pool) < count:
+            raise CommandError("随机范围内没有足够的敲门端口")
+        knocks = rng.sample(pool, count)
+    for port in knocks:
+        if port == ss_port or port in open_ports:
+            raise CommandError("敲门端口 %s 与放行端口或 Shadowsocks 端口相同" % port)
+    return ss_port, knocks
 
 
 def check_password(method, password):
@@ -315,18 +344,39 @@ def parse_v6_list(value):
     return nets
 
 
+def knock_ports_from_settings(settings):
+    spec = str(settings.get("KNOCK_PORTS") or "").strip()
+    if spec and spec != "generate":
+        return parse_port_list(spec, "KNOCK_PORTS")
+    if str(settings.get("PORT_A") or "").strip():
+        return [require_int(settings["PORT_A"], "PORT_A", 1, 65535)]
+    raise CommandError("没有敲门端口")
+
+
+def nft_port_set(ports):
+    return "{ %s }" % ", ".join(str(port) for port in ports)
+
+
 def rule_statements(settings):
     if settings["WHITELIST_SCOPE"] != "dport_b":
         raise CommandError("WHITELIST_SCOPE 只支持 dport_b")
     ssh_port = require_int(settings["SSH_PORT"] or "22", "SSH_PORT", 1, 65535)
     ss_port = require_int(settings["SS_PORT"], "SS_PORT", 1, 65535)
-    port_a = require_int(settings["PORT_A"], "PORT_A", 1, 65535)
-    if ss_port == port_a:
-        raise CommandError("端口 A 与端口 B 相同")
+    knock_ports = knock_ports_from_settings(settings)
     open_ports = parse_allow_ports(settings.get("ALLOW_PORTS", ""), ssh_port)
-    for port in open_ports:
-        if port in (ss_port, port_a):
-            raise CommandError("额外放行端口 %s 与端口 A 或端口 B 相同" % port)
+    for port in list(open_ports) + knock_ports:
+        if port == ss_port:
+            raise CommandError("端口 %s 与 Shadowsocks 端口相同" % port)
+    for port in knock_ports:
+        if port in open_ports:
+            raise CommandError("敲门端口 %s 与默认放行端口相同" % port)
+    safe = []
+    for port in list(open_ports) + knock_ports + [ss_port]:
+        if port not in safe:
+            safe.append(port)
+    safe_set = nft_port_set(safe)
+    knock_set = nft_port_set(knock_ports)
+    ban_timeout = require_int(settings.get("BLACKLIST_TIMEOUT", "86400"), "BLACKLIST_TIMEOUT", 1, 31536000)
     statements = [
         "ct state established,related accept",
         'iif "lo" accept',
@@ -337,26 +387,43 @@ def rule_statements(settings):
         statements.append("ip6 saddr %s accept" % net)
     for port in open_ports:
         statements.append("tcp dport %s accept" % port)
-    statements.extend(
-        [
-            "ip saddr @whitelist tcp dport %s accept" % ss_port,
-            "ip saddr @whitelist udp dport %s accept" % ss_port,
-            'ip protocol tcp tcp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
-            % (port_a, LOG_PREFIX),
-            'ip protocol udp udp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
-            % (port_a, LOG_PREFIX),
-        ]
-    )
+        statements.append("udp dport %s accept" % port)
+    for proto, match in (("tcp", "tcp dport"), ("udp", "udp dport")):
+        guard = "ip protocol %s %s != %s" % (proto, match, safe_set)
+        statements.append("%s add @blacklist { ip saddr timeout %ss }" % (guard, ban_timeout))
+        statements.append("%s delete @whitelist { ip saddr }" % guard)
+        statements.append(
+            '%s limit rate 20/second burst 40 packets log prefix "%s"' % (guard, BAN_PREFIX)
+        )
+        statements.append("%s drop" % guard)
+    statements.append("ip saddr @blacklist drop")
+    for proto, match in (("tcp", "tcp dport"), ("udp", "udp dport")):
+        statements.append(
+            'ip protocol %s %s %s limit rate 10/second burst 20 packets log prefix "%s" drop'
+            % (proto, match, knock_set, LOG_PREFIX)
+        )
+    statements.append("ip saddr @whitelist tcp dport %s accept" % ss_port)
+    statements.append("ip saddr @whitelist udp dport %s accept" % ss_port)
     return statements
 
 
 def render_nft(settings):
     size = require_int(settings["WHITELIST_MAX"], "WHITELIST_MAX", 1, 65535)
+    ban_size = require_int(settings.get("BLACKLIST_MAX", "10000"), "BLACKLIST_MAX", 1, 65535)
+    ban_timeout = require_int(settings.get("BLACKLIST_TIMEOUT", "86400"), "BLACKLIST_TIMEOUT", 1, 31536000)
     lines = [
         "table inet %s {" % NFT_TABLE,
         "    set whitelist {",
         "        type ipv4_addr",
         "        size %s" % size,
+        "        flags dynamic",
+        "    }",
+        "",
+        "    set blacklist {",
+        "        type ipv4_addr",
+        "        size %s" % ban_size,
+        "        flags dynamic,timeout",
+        "        timeout %ss" % ban_timeout,
         "    }",
         "",
         "    chain input {",
@@ -367,6 +434,106 @@ def render_nft(settings):
         lines.append("        %s" % statement)
     lines.extend(["    }", "}", ""])
     return "\n".join(lines)
+
+
+def set_flags(set_obj):
+    flags = set_obj.get("flags") or []
+    if isinstance(flags, str):
+        return {flags}
+    return set(flags)
+
+
+def set_elements(set_obj):
+    found = []
+    for item in set_obj.get("elem") or []:
+        if isinstance(item, str):
+            found.append((item, None))
+            continue
+        if isinstance(item, dict) and isinstance(item.get("elem"), dict):
+            item = item["elem"]
+        if not isinstance(item, dict):
+            continue
+        value = item.get("val") or item.get("elem")
+        if value:
+            found.append((str(value), item.get("expires")))
+    return found
+
+
+def needs_set_rebuild(set_obj, timeout):
+    if set_obj is None:
+        return True
+    flags = set_flags(set_obj)
+    if "dynamic" not in flags:
+        return True
+    if timeout and "timeout" not in flags:
+        return True
+    return False
+
+
+def build_apply_script(settings, whitelist_set, blacklist_set):
+    lines = ["flush chain inet %s input" % NFT_TABLE]
+    white_size = require_int(settings["WHITELIST_MAX"], "WHITELIST_MAX", 1, 65535)
+    black_size = require_int(settings.get("BLACKLIST_MAX", "10000"), "BLACKLIST_MAX", 1, 65535)
+    ban_timeout = require_int(settings.get("BLACKLIST_TIMEOUT", "86400"), "BLACKLIST_TIMEOUT", 1, 31536000)
+    if needs_set_rebuild(whitelist_set, False):
+        if whitelist_set is not None:
+            lines.append("delete set inet %s whitelist" % NFT_TABLE)
+        lines.append(
+            "add set inet %s whitelist { type ipv4_addr; size %s; flags dynamic; }" % (NFT_TABLE, white_size)
+        )
+        elements = [ip for ip, _expires in set_elements(whitelist_set or {}) if is_public_ipv4(ip)]
+        if elements:
+            lines.append("add element inet %s whitelist { %s }" % (NFT_TABLE, ", ".join(elements)))
+    if needs_set_rebuild(blacklist_set, True):
+        if blacklist_set is not None:
+            lines.append("delete set inet %s blacklist" % NFT_TABLE)
+        lines.append(
+            "add set inet %s blacklist { type ipv4_addr; size %s; flags dynamic,timeout; timeout %ss; }"
+            % (NFT_TABLE, black_size, ban_timeout)
+        )
+        for ip, expires in set_elements(blacklist_set or {}):
+            if not is_public_ipv4(ip):
+                continue
+            seconds = ban_timeout if not expires else max(1, int(expires))
+            lines.append("add element inet %s blacklist { %s timeout %ss }" % (NFT_TABLE, ip, seconds))
+    for statement in rule_statements(settings):
+        lines.append("add rule inet %s input %s" % (NFT_TABLE, statement))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def nft_json_set(name):
+    result = subprocess.run(
+        [nft_bin(), "-j", "list", "set", NFT_FAMILY, NFT_TABLE, name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except ValueError:
+        return None
+    for item in data.get("nftables", []):
+        if "set" in item:
+            return item["set"]
+    return None
+
+
+def apply_rules(settings):
+    script = build_apply_script(settings, nft_json_set("whitelist"), nft_json_set("blacklist"))
+    fd, path = tempfile.mkstemp(prefix="shadownft-", suffix=".nft")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        nft_run(["-f", path])
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def render_refresh(settings):
@@ -403,7 +570,8 @@ def client_text(settings):
             "method: %s" % settings["SS_METHOD"],
             "password: %s" % settings["SS_PASSWORD"],
             "port_b: %s" % settings["SS_PORT"],
-            "port_a: %s" % settings["PORT_A"],
+            "knock_ports: %s" % ",".join(str(port) for port in knock_ports_from_settings(settings)),
+            "port_a: %s" % knock_ports_from_settings(settings)[0],
             ss_uri(settings["SS_METHOD"], settings["SS_PASSWORD"], settings["PUBLIC_IP"], settings["SS_PORT"]),
             "",
         ]
@@ -495,19 +663,51 @@ def load_order(path, limit):
     return order
 
 
+def parse_blacklist_text(text, now):
+    found = {}
+    for raw in str(text).splitlines():
+        parts = raw.split()
+        if len(parts) != 2 or not is_public_ipv4(parts[0]):
+            continue
+        try:
+            expiry = float(parts[1])
+        except ValueError:
+            continue
+        if expiry > now:
+            found[parts[0]] = expiry
+    return found
+
+
+def load_blacklist(path, now):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        return parse_blacklist_text(handle.read(), now)
+
+
+def blacklist_text(entries):
+    lines = ["%s %d" % (ip, int(expiry)) for ip, expiry in sorted(entries.items(), key=lambda item: item[1])]
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 class Watcher(object):
     def __init__(self, settings):
-        self.port_a = require_int(settings["PORT_A"], "PORT_A", 1, 65535)
+        self.knock_ports = set(knock_ports_from_settings(settings))
+        self.use_api = env_bool(settings.get("IP_API", "no"), "IP_API")
         self.regions = split_csv(settings["ALLOW_REGIONS"])
-        self.allow_mobile = env_bool(settings["ALLOW_MOBILE"])
+        self.allow_mobile = env_bool(settings["ALLOW_MOBILE"], "ALLOW_MOBILE")
         self.limit = require_int(settings["WHITELIST_MAX"], "WHITELIST_MAX", 1, 65535)
         self.cooldown = require_int(settings["KNOCK_COOLDOWN"], "KNOCK_COOLDOWN", 1, 1000000)
         self.negative_ttl = require_int(settings["NEGATIVE_TTL"], "NEGATIVE_TTL", 1, 1000000)
         self.rate = require_int(settings["IP_API_RATE"], "IP_API_RATE", 1, 1000000)
         self.queue_max = require_int(settings["QUEUE_MAX"], "QUEUE_MAX", 1, 10000)
+        self.blacklist_timeout = require_int(settings.get("BLACKLIST_TIMEOUT", "86400"), "BLACKLIST_TIMEOUT", 1, 31536000)
         self.api_url = settings["IP_API_URL"]
         self.api_lang = settings["IP_API_LANG"]
         self.order = load_order(ORDER_PATH, self.limit)
+        self.blacklist = load_blacklist(BLACKLIST_PATH, time.time())
         self.lock = threading.Lock()
         self.skip_until = {}
         self.inflight = set()
@@ -521,12 +721,40 @@ class Watcher(object):
         os.makedirs(os.path.dirname(ORDER_PATH), 0o700, exist_ok=True)
         atomic_write(ORDER_PATH, "".join("%s\n" % ip for ip in self.order), 0o600)
 
+    def save_blacklist(self):
+        os.makedirs(os.path.dirname(BLACKLIST_PATH), 0o700, exist_ok=True)
+        now = time.time()
+        self.blacklist = {ip: expiry for ip, expiry in self.blacklist.items() if expiry > now}
+        atomic_write(BLACKLIST_PATH, blacklist_text(self.blacklist), 0o600)
+
+    def blacklisted(self, ip):
+        expiry = self.blacklist.get(ip, 0)
+        if expiry <= time.time():
+            self.blacklist.pop(ip, None)
+            return False
+        return True
+
     def restore_set(self):
         for ip in list(self.order):
+            if self.blacklisted(ip):
+                self.order.remove(ip)
+                continue
             try:
                 nft_add(ip)
             except Exception as exc:
                 LOG.error("恢复白名单 %s 失败: %s", ip, exc)
+        self.save()
+
+    def restore_blacklist(self):
+        now = time.time()
+        for ip, expiry in list(self.blacklist.items()):
+            remaining = int(expiry - now)
+            if remaining <= 0:
+                continue
+            try:
+                nft_add_blacklist(ip, remaining)
+            except Exception as exc:
+                LOG.error("恢复黑名单 %s 失败: %s", ip, exc)
 
     def remember_skip(self, ip, seconds):
         with self.lock:
@@ -535,15 +763,44 @@ class Watcher(object):
                 now = time.time()
                 self.skip_until = {key: until for key, until in self.skip_until.items() if until > now}
 
+    def handle_ban(self, line):
+        src = SRC_RE.search(line)
+        if not src:
+            return
+        ip = src.group(1)
+        if not is_public_ipv4(ip):
+            return
+        with self.lock:
+            self.blacklist[ip] = time.time() + self.blacklist_timeout
+            if ip in self.order:
+                self.order.remove(ip)
+            self.save()
+            self.save_blacklist()
+        try:
+            nft_delete(ip)
+        except Exception as exc:
+            LOG.error("移出白名单 %s 失败: %s", ip, exc)
+        LOG.info("拉黑 %s", ip)
+
     def handle_line(self, line):
+        if BAN_PREFIX in line:
+            self.handle_ban(line)
+            return
         if LOG_PREFIX not in line:
             return
         src = SRC_RE.search(line)
         dpt = DPT_RE.search(line)
-        if not src or not dpt or int(dpt.group(1)) != self.port_a:
+        if not src or not dpt or int(dpt.group(1)) not in self.knock_ports:
             return
         ip = src.group(1)
         if not is_public_ipv4(ip):
+            return
+        if self.blacklisted(ip):
+            LOG.info("黑名单中，忽略敲门: %s", ip)
+            return
+        if not self.use_api:
+            self.admit(ip)
+            LOG.info("加白 %s", ip)
             return
         with self.queue_cond:
             if ip in self.order:
@@ -597,6 +854,9 @@ class Watcher(object):
         return 200, payload
 
     def admit(self, ip):
+        if self.blacklisted(ip):
+            LOG.info("黑名单中，不加白: %s", ip)
+            return
         with self.lock:
             if ip in self.order:
                 bump_order(self.order, ip, self.limit)
@@ -629,6 +889,9 @@ class Watcher(object):
                 LOG.error("删除多余白名单 %s 失败: %s", extra, exc)
 
     def process(self, ip, pause_until):
+        if self.blacklisted(ip):
+            LOG.info("黑名单中，不加白: %s", ip)
+            return
         now = time.time()
         if pause_until[0] > now:
             time.sleep(min(pause_until[0] - now, 60))
@@ -683,8 +946,9 @@ class Watcher(object):
 
     def run(self):
         os.makedirs(os.path.dirname(ORDER_PATH), 0o700, exist_ok=True)
+        self.restore_blacklist()
         self.restore_set()
-        LOG.info("监听端口 A %s 的敲门，白名单上限 %s", self.port_a, self.limit)
+        LOG.info("监听敲门端口 %s，白名单上限 %s，ip-api=%s", ",".join(str(port) for port in sorted(self.knock_ports)), self.limit, "yes" if self.use_api else "no")
         thread = threading.Thread(target=self.worker, name="shadownft-query")
         thread.start()
         try:
@@ -736,6 +1000,25 @@ def nft_add(ip):
     if "exist" in detail:
         return
     raise CommandError((result.stderr or result.stdout or "nft add 失败").strip())
+
+
+def nft_add_blacklist(ip, seconds):
+    if not is_public_ipv4(ip):
+        raise CommandError("拒绝把非公网地址写入黑名单")
+    seconds = max(1, int(seconds))
+    result = subprocess.run(
+        [nft_bin(), "add", "element", NFT_FAMILY, NFT_TABLE, "blacklist", "{ %s timeout %ss }" % (ip, seconds)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=10,
+    )
+    if result.returncode == 0:
+        return
+    detail = ((result.stderr or "") + (result.stdout or "")).lower()
+    if "exist" in detail:
+        return
+    raise CommandError((result.stderr or result.stdout or "nft add blacklist 失败").strip())
 
 
 def nft_delete(ip):
@@ -801,9 +1084,10 @@ def cmd_write_shell(path):
 
 
 def require_ready(settings):
-    for key in ("SS_PORT", "PORT_A", "SSH_PORT", "SS_PASSWORD", "PUBLIC_IP"):
+    for key in ("SS_PORT", "SSH_PORT", "SS_PASSWORD", "PUBLIC_IP"):
         if not str(settings.get(key, "")).strip():
             raise CommandError("%s 还是空的" % key)
+    knock_ports_from_settings(settings)
     check_password(settings["SS_METHOD"], settings["SS_PASSWORD"])
 
 
@@ -870,13 +1154,22 @@ def run_self_test():
     except CommandError:
         pass
 
-    port_b, port_a = choose_ports("", "", 22, 20000, 20010, 1000, random.Random(1))
-    assert 20000 <= port_b <= 20010 and port_b != 22
-    assert port_b < port_a <= port_b + 1000 <= 65535 and port_a != 22
-    assert choose_ports(15000, 16000, 22, 10000, 20000, 1000, random.Random(0)) == (15000, 16000)
+    assert fresh["IP_API"] == "no"
+    assert fresh["KNOCK_COUNT"] == "1"
+    assert fresh["BLACKLIST_TIMEOUT"] == "86400"
+    port_b, knocks = choose_service_ports("", "", "", "2", 22, "22,80,443", 20000, 20010, random.Random(1))
+    assert 20000 <= port_b <= 20010 and port_b not in (22, 80, 443)
+    assert len(knocks) == 2 and port_b not in knocks
+    assert all(20000 <= port <= 20010 and port not in (22, 80, 443) for port in knocks)
+    assert choose_service_ports(15000, "", "16000", "3", 22, "", 10000, 20000, random.Random(0)) == (15000, [16000])
     try:
-        choose_ports(65534, "", 65535, 10000, 20000, 1000, random.Random(0))
-        raise AssertionError("offset should fail")
+        choose_service_ports(15000, "15000", "", "1", 22, "", 10000, 20000, random.Random(0))
+        raise AssertionError("knock port should not reuse shadowsocks")
+    except CommandError:
+        pass
+    try:
+        choose_service_ports(80, "", "", "1", 22, "", 10000, 20000, random.Random(0))
+        raise AssertionError("port B should not reuse an open port")
     except CommandError:
         pass
 
@@ -897,7 +1190,12 @@ def run_self_test():
     assert "tcp dport 443 accept" in rendered
     assert "ip saddr @whitelist tcp dport 15000 accept" in rendered
     assert "ip saddr @whitelist udp dport 15000 accept" in rendered
-    assert 'tcp dport 16000 limit rate 10/second burst 20 packets log prefix "shadownft "' in rendered
+    assert 'tcp dport { 16000 } limit rate 10/second burst 20 packets log prefix "shadownft "' in rendered
+    assert "tcp dport != { 22, 80, 443, 16000, 15000 }" in rendered
+    assert "add @blacklist { ip saddr timeout 86400s }" in rendered
+    assert "delete @whitelist { ip saddr }" in rendered
+    assert 'log prefix "shadownft-ban "' in rendered
+    assert "flags dynamic" in rendered
     assert "size 100" in rendered
     assert "ip saddr 10.0.0.0/8 accept" in rendered
     assert "ip6 saddr fe80::/10 accept" in rendered
@@ -914,11 +1212,18 @@ def run_self_test():
         raise AssertionError("allow port should not overlap port B")
     except CommandError:
         pass
-    try:
-        choose_ports(80, "", 22, 10000, 20000, 1000, random.Random(0))
-        raise AssertionError("port B should not reuse an open port")
-    except CommandError:
-        pass
+    kept = parse_blacklist_text("1.2.3.4 200\n10.0.0.1 999\nbad line\n8.8.8.8 50\n", 100)
+    assert kept == {"1.2.3.4": 200.0}
+    rebuilt = build_apply_script(sample, {"flags": ["interval"], "elem": ["8.8.8.8"]}, None)
+    assert "delete set inet shadownft whitelist" in rebuilt
+    assert "add element inet shadownft whitelist { 8.8.8.8 }" in rebuilt
+    assert "add set inet shadownft blacklist" in rebuilt
+    steady = build_apply_script(
+        sample,
+        {"flags": ["dynamic"], "elem": ["1.2.3.4"]},
+        {"flags": ["dynamic", "timeout"], "elem": []},
+    )
+    assert "delete set" not in steady
     refresh = render_refresh(sample)
     assert refresh.startswith("flush chain inet shadownft input\n")
     assert "add rule inet shadownft input tcp dport 443 accept" in refresh
@@ -966,17 +1271,21 @@ def main(argv):
         if command == "--choose-ports":
             settings = settings_from_environ()
             ssh_port = settings["SSH_PORT"] or "22"
-            port_b, port_a = choose_ports(
+            port_b, knocks = choose_service_ports(
                 settings["SS_PORT"],
-                settings["PORT_A"],
+                settings.get("KNOCK_PORTS", ""),
+                settings.get("PORT_A", ""),
+                settings.get("KNOCK_COUNT", "1"),
                 ssh_port,
+                settings.get("ALLOW_PORTS", ""),
                 settings["PORT_MIN"],
                 settings["PORT_MAX"],
-                settings["PORT_A_OFFSET_MAX"],
                 random.SystemRandom(),
-                settings.get("ALLOW_PORTS", ""),
             )
-            sys.stdout.write("%s\n%s\n" % (port_b, port_a))
+            sys.stdout.write("%s\n%s\n" % (port_b, ",".join(str(port) for port in knocks)))
+            return 0
+        if command == "--apply-rules":
+            apply_rules(settings_from_environ())
             return 0
         if command == "--check-password":
             settings = settings_from_environ()
