@@ -33,6 +33,7 @@ DEFAULTS = {
     "SS_MODE": "tcp_and_udp",
     "SS_VERSION": "",
     "SSH_PORT": "",
+    "ALLOW_PORTS": "",
     "INTRANET_V4": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8",
     "INTRANET_V6": "::1,fc00::/7,fe80::/10",
     "ALLOW_REGIONS": "CQ,重庆",
@@ -171,35 +172,55 @@ def resolve_settings(explicit, file_text):
     return merged
 
 
-def choose_ports(ss_port, port_a, ssh_port, port_min, port_max, offset_max, rng):
+def parse_allow_ports(value, ssh_port):
+    raw = str(value or "").strip()
+    if raw:
+        parts = split_csv(raw)
+    else:
+        parts = [str(ssh_port), "80", "443"]
+    ports = []
+    seen = set()
+    for part in parts:
+        port = require_int(part, "ALLOW_PORTS", 1, 65535)
+        if port in seen:
+            continue
+        seen.add(port)
+        ports.append(port)
+    if not ports:
+        raise CommandError("ALLOW_PORTS 是空的")
+    return ports
+
+
+def choose_ports(ss_port, port_a, ssh_port, port_min, port_max, offset_max, rng, allow_ports=""):
     ssh_port = int(ssh_port)
     port_min = int(port_min)
     port_max = int(port_max)
     offset_max = int(offset_max)
+    open_ports = set(parse_allow_ports(allow_ports, ssh_port))
     if ss_port in ("", None):
-        pool = [port for port in range(port_min, port_max + 1) if port != ssh_port]
+        pool = [port for port in range(port_min, port_max + 1) if port not in open_ports]
         if not pool:
             raise CommandError("随机范围内没有可用的端口 B")
         ss_port = rng.choice(pool)
     else:
         ss_port = require_int(ss_port, "SS_PORT", 1, 65535)
-        if ss_port == ssh_port:
-            raise CommandError("端口 B 和 SSH 端口相同")
+        if ss_port in open_ports:
+            raise CommandError("端口 B 与额外放行端口相同")
     if port_a in ("", None):
         pool = []
         for offset in range(1, offset_max + 1):
             candidate = ss_port + offset
             if candidate > 65535:
                 break
-            if candidate != ssh_port:
+            if candidate != ss_port and candidate not in open_ports:
                 pool.append(candidate)
         if not pool:
             raise CommandError("端口 B 太大，无法再加 1 到 %s 得到端口 A" % offset_max)
         port_a = rng.choice(pool)
     else:
         port_a = require_int(port_a, "PORT_A", 1, 65535)
-        if port_a in (ss_port, ssh_port):
-            raise CommandError("端口 A 与端口 B 或 SSH 端口相同")
+        if port_a == ss_port or port_a in open_ports:
+            raise CommandError("端口 A 与端口 B 或额外放行端口相同")
     return ss_port, port_a
 
 
@@ -294,14 +315,42 @@ def parse_v6_list(value):
     return nets
 
 
-def render_nft(settings):
+def rule_statements(settings):
     if settings["WHITELIST_SCOPE"] != "dport_b":
         raise CommandError("WHITELIST_SCOPE 只支持 dport_b")
-    ssh_port = require_int(settings["SSH_PORT"], "SSH_PORT", 1, 65535)
+    ssh_port = require_int(settings["SSH_PORT"] or "22", "SSH_PORT", 1, 65535)
     ss_port = require_int(settings["SS_PORT"], "SS_PORT", 1, 65535)
     port_a = require_int(settings["PORT_A"], "PORT_A", 1, 65535)
-    if len({ssh_port, ss_port, port_a}) != 3:
-        raise CommandError("SSH、端口 A、端口 B 必须是三个不同端口")
+    if ss_port == port_a:
+        raise CommandError("端口 A 与端口 B 相同")
+    open_ports = parse_allow_ports(settings.get("ALLOW_PORTS", ""), ssh_port)
+    for port in open_ports:
+        if port in (ss_port, port_a):
+            raise CommandError("额外放行端口 %s 与端口 A 或端口 B 相同" % port)
+    statements = [
+        "ct state established,related accept",
+        'iif "lo" accept',
+    ]
+    for net in parse_v4_list(settings["INTRANET_V4"]):
+        statements.append("ip saddr %s accept" % net)
+    for net in parse_v6_list(settings["INTRANET_V6"]):
+        statements.append("ip6 saddr %s accept" % net)
+    for port in open_ports:
+        statements.append("tcp dport %s accept" % port)
+    statements.extend(
+        [
+            "ip saddr @whitelist tcp dport %s accept" % ss_port,
+            "ip saddr @whitelist udp dport %s accept" % ss_port,
+            'ip protocol tcp tcp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
+            % (port_a, LOG_PREFIX),
+            'ip protocol udp udp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
+            % (port_a, LOG_PREFIX),
+        ]
+    )
+    return statements
+
+
+def render_nft(settings):
     size = require_int(settings["WHITELIST_MAX"], "WHITELIST_MAX", 1, 65535)
     lines = [
         "table inet %s {" % NFT_TABLE,
@@ -313,27 +362,18 @@ def render_nft(settings):
         "    chain input {",
         "        type filter hook input priority 0; policy drop;",
         "",
-        "        ct state established,related accept",
-        '        iif "lo" accept',
     ]
-    for net in parse_v4_list(settings["INTRANET_V4"]):
-        lines.append("        ip saddr %s accept" % net)
-    for net in parse_v6_list(settings["INTRANET_V6"]):
-        lines.append("        ip6 saddr %s accept" % net)
-    lines.extend(
-        [
-            "        tcp dport %s accept" % ssh_port,
-            "        ip saddr @whitelist tcp dport %s accept" % ss_port,
-            "        ip saddr @whitelist udp dport %s accept" % ss_port,
-            '        ip protocol tcp tcp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
-            % (port_a, LOG_PREFIX),
-            '        ip protocol udp udp dport %s limit rate 10/second burst 20 packets log prefix "%s" drop'
-            % (port_a, LOG_PREFIX),
-            "    }",
-            "}",
-            "",
-        ]
-    )
+    for statement in rule_statements(settings):
+        lines.append("        %s" % statement)
+    lines.extend(["    }", "}", ""])
+    return "\n".join(lines)
+
+
+def render_refresh(settings):
+    lines = ["flush chain inet %s input" % NFT_TABLE]
+    for statement in rule_statements(settings):
+        lines.append("add rule inet %s input %s" % (NFT_TABLE, statement))
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -853,6 +893,8 @@ def run_self_test():
     rendered = render_nft(sample)
     assert "policy drop;" in rendered
     assert "tcp dport 22 accept" in rendered
+    assert "tcp dport 80 accept" in rendered
+    assert "tcp dport 443 accept" in rendered
     assert "ip saddr @whitelist tcp dport 15000 accept" in rendered
     assert "ip saddr @whitelist udp dport 15000 accept" in rendered
     assert 'tcp dport 16000 limit rate 10/second burst 20 packets log prefix "shadownft "' in rendered
@@ -860,6 +902,26 @@ def run_self_test():
     assert "ip saddr 10.0.0.0/8 accept" in rendered
     assert "ip6 saddr fe80::/10 accept" in rendered
     assert "dport 16000 accept" not in rendered
+    custom = dict(sample)
+    custom["ALLOW_PORTS"] = "8080,8080,8443"
+    custom_rendered = render_nft(custom)
+    assert "tcp dport 8080 accept" in custom_rendered
+    assert "tcp dport 8443 accept" in custom_rendered
+    assert "tcp dport 80 accept" not in custom_rendered
+    custom["ALLOW_PORTS"] = "15000"
+    try:
+        render_nft(custom)
+        raise AssertionError("allow port should not overlap port B")
+    except CommandError:
+        pass
+    try:
+        choose_ports(80, "", 22, 10000, 20000, 1000, random.Random(0))
+        raise AssertionError("port B should not reuse an open port")
+    except CommandError:
+        pass
+    refresh = render_refresh(sample)
+    assert refresh.startswith("flush chain inet shadownft input\n")
+    assert "add rule inet shadownft input tcp dport 443 accept" in refresh
 
     drops = foreign_drop_chains(
         {
@@ -912,6 +974,7 @@ def main(argv):
                 settings["PORT_MAX"],
                 settings["PORT_A_OFFSET_MAX"],
                 random.SystemRandom(),
+                settings.get("ALLOW_PORTS", ""),
             )
             sys.stdout.write("%s\n%s\n" % (port_b, port_a))
             return 0
@@ -919,9 +982,19 @@ def main(argv):
             settings = settings_from_environ()
             check_password(settings["SS_METHOD"], settings["SS_PASSWORD"])
             return 0
+        if command == "--normalize-allow-ports":
+            settings = settings_from_environ()
+            ssh_port = settings["SSH_PORT"] or "22"
+            ports = parse_allow_ports(settings.get("ALLOW_PORTS", ""), ssh_port)
+            sys.stdout.write(",".join(str(port) for port in ports) + "\n")
+            return 0
         if command == "--render-nft":
             settings = settings_from_environ()
             sys.stdout.write(render_nft(settings))
+            return 0
+        if command == "--render-rules":
+            settings = settings_from_environ()
+            sys.stdout.write(render_refresh(settings))
             return 0
         if command == "--check-firewall":
             found = foreign_drop_chains(read_json(argv[2]))

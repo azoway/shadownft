@@ -8,7 +8,9 @@ CONFIG_DIR=/etc/shadownft
 CONFIG_ENV=$CONFIG_DIR/config.env
 CLIENT_TXT=$CONFIG_DIR/client.txt
 NFT_FILE=$CONFIG_DIR/shadownft.nft
+NFT_RULES=$CONFIG_DIR/shadownft.rules.nft
 STATE_DIR=/var/lib/shadownft
+BASE_URL=${BASE_URL:-https://raw.githubusercontent.com/azoway/shadownft/main}
 CONFIRMED=$STATE_DIR/confirmed
 SS_DIR=/etc/shadowsocks-rust
 SS_CONFIG=$SS_DIR/config.json
@@ -21,14 +23,15 @@ SSSERVICE=/usr/local/bin/ssservice
 usage() {
   cat <<'EOF'
 用法:
-  sudo ./install.sh
-  sudo SS_PORT=18000 PUBLIC_IP=203.0.113.10 ./install.sh
-  sudo /usr/local/sbin/shadownft confirm
-  sudo /usr/local/sbin/shadownft rollback
-  sudo /usr/local/sbin/shadownft uninstall
+  curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | bash
+  confirm=yes bash /usr/local/sbin/shadownft
+  ALLOW_PORTS=22,80,443,8443 bash /usr/local/sbin/shadownft
+  /usr/local/sbin/shadownft rollback
+  /usr/local/sbin/shadownft uninstall
 
-环境变量见 README。已写入 /etc/shadownft/config.env 的值会保留，
+已写入 /etc/shadownft/config.env 的端口、密码和额外放行端口会保留。
 这次命令里显式传入的同名变量覆盖它们。
+confirm=yes 或运行时输入 y，才会关闭 ufw、firewalld 和系统 nftables 服务。
 EOF
 }
 
@@ -50,6 +53,43 @@ require_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
     die "需要 systemd"
   fi
+}
+
+maybe_reexec() {
+  if [ -f "$0" ]; then
+    return 0
+  fi
+  require_root
+  require_linux
+  command -v curl >/dev/null 2>&1 || die "需要 curl"
+  install -d -m 0755 /usr/local/sbin "$LIB_DIR"
+  curl -fsSL --retry 3 --max-time 60 "$BASE_URL/install.sh" -o "$BIN"
+  curl -fsSL --retry 3 --max-time 60 "$BASE_URL/shadownft-watch.py" -o "$PY_INSTALLED"
+  chmod 755 "$BIN" "$PY_INSTALLED"
+  exec "$BIN" "$@"
+}
+
+clean_requested() {
+  if [ "${confirm:-}" = "yes" ] || [ "${CONFIRM:-}" = "yes" ] || [ "${REPLACE_FIREWALL:-}" = "1" ]; then
+    return 0
+  fi
+  return 1
+}
+
+ask_clean() {
+  if clean_requested; then
+    return 0
+  fi
+  if [ -r /dev/tty ]; then
+    printf '%s' "发现已有防火墙。输入 y 关闭 ufw、firewalld 和系统 nftables 服务，直接回车则保留: " >/dev/tty
+    IFS= read -r answer </dev/tty || true
+    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+      return 0
+    fi
+  else
+    printf '%s\n' "没有交互终端，也没有 confirm=yes，保留已有防火墙。" >&2
+  fi
+  return 1
 }
 
 script_path() {
@@ -212,34 +252,38 @@ ensure_user() {
   fi
   if ! id -u shadowsocks >/dev/null 2>&1; then
     useradd --system --gid shadowsocks --no-create-home --shell "$nologin" shadowsocks
-  fi
-}
-
-arm_rollback() {
-  systemctl stop shadownft-rollback >/dev/null 2>&1 || true
-  if ! systemd-run --collect --unit=shadownft-rollback --on-active=60s "$BIN" rollback; then
-    systemd-run --unit=shadownft-rollback --on-active=60s "$BIN" rollback
+  elif ! id -nG shadowsocks | tr ' ' '\n' | grep -qx shadowsocks; then
+    usermod -aG shadowsocks shadowsocks
   fi
 }
 
 cmd_load_nft() {
-  local nft_bin
+  local nft_bin size
   nft_bin=$(find_nft)
   if [ ! -f "$NFT_FILE" ]; then
     die "没有 $NFT_FILE"
   fi
-  if "$nft_bin" list table inet shadownft >/dev/null 2>&1; then
-    "$nft_bin" delete table inet shadownft
+  if ! "$nft_bin" list table inet shadownft >/dev/null 2>&1; then
+    "$nft_bin" -f "$NFT_FILE"
+    return 0
   fi
-  "$nft_bin" -f "$NFT_FILE"
+  if ! "$nft_bin" list set inet shadownft whitelist >/dev/null 2>&1; then
+    size=$(awk '/^[[:space:]]*size / {print $2; exit}' "$NFT_FILE")
+    if [ -z "$size" ]; then
+      size=100
+    fi
+    "$nft_bin" add set inet shadownft whitelist "{ type ipv4_addr; size ${size}; }"
+  fi
+  "$nft_bin" add chain inet shadownft input '{ type filter hook input priority 0; policy drop; }' >/dev/null 2>&1 || true
+  if [ ! -f "$NFT_RULES" ]; then
+    die "没有 $NFT_RULES"
+  fi
+  "$nft_bin" -f "$NFT_RULES"
 }
 
 cmd_confirm() {
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
-  touch "$CONFIRMED"
-  systemctl stop shadownft-rollback >/dev/null 2>&1 || true
-  printf '%s\n' "已确认，60 秒回滚已取消。"
+  systemctl stop shadownft-rollback.timer shadownft-rollback.service >/dev/null 2>&1 || true
+  printf '%s\n' "已取消遗留的自动回滚。重复安装默认保留已有规则。"
 }
 
 cmd_rollback() {
@@ -257,7 +301,7 @@ cmd_rollback() {
 }
 
 cmd_uninstall() {
-  systemctl stop shadownft-rollback >/dev/null 2>&1 || true
+  systemctl stop shadownft-rollback.timer shadownft-rollback.service >/dev/null 2>&1 || true
   systemctl disable --now shadownft >/dev/null 2>&1 || true
   systemctl disable --now shadowsocks-rust >/dev/null 2>&1 || true
   if [ -x /usr/sbin/nft ]; then
@@ -285,16 +329,17 @@ cmd_uninstall() {
 
 cmd_install() {
   local SCRIPT_PATH PY PYTHON NFT ruleset version ports
-  local pybin armed=0
+  local pybin clean_now=0
   umask 077
   set -a
+  systemctl stop shadownft-rollback.timer shadownft-rollback.service >/dev/null 2>&1 || true
+  if clean_requested; then
+    clean_now=1
+  fi
   SCRIPT_PATH=$(script_path)
   PY=$(dirname "$SCRIPT_PATH")/shadownft-watch.py
   if [ ! -f "$PY" ]; then
     PY=$PY_INSTALLED
-  fi
-  if [ ! -f "$PY" ]; then
-    die "找不到 shadownft-watch.py"
   fi
 
   install_packages
@@ -302,26 +347,34 @@ cmd_install() {
   NFT=$(find_nft)
 
   install -d -m 0755 "$LIB_DIR" /usr/local/sbin /usr/local/bin /etc/systemd/system
-  install -d -m 0700 "$CONFIG_DIR" "$STATE_DIR" "$SS_DIR"
-  if [ "$PY" != "$PY_INSTALLED" ]; then
+  install -d -m 0700 "$CONFIG_DIR" "$STATE_DIR"
+  install -d "$SS_DIR"
+  if [ -f "$PY" ] && [ "$PY" != "$PY_INSTALLED" ]; then
     install -m 0755 "$PY" "$PY_INSTALLED"
+  elif [ ! -f "$PY_INSTALLED" ]; then
+    curl -fsSL --retry 3 --max-time 60 "$BASE_URL/shadownft-watch.py" -o "$PY_INSTALLED"
+    chmod 755 "$PY_INSTALLED"
   fi
-  if [ "$SCRIPT_PATH" != "$BIN" ]; then
+  if [ -f "$SCRIPT_PATH" ] && [ "$SCRIPT_PATH" != "$BIN" ]; then
     install -m 0755 "$SCRIPT_PATH" "$BIN"
   fi
   PY=$PY_INSTALLED
+  if [ ! -f "$PY" ]; then
+    die "找不到 shadownft-watch.py"
+  fi
 
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   ruleset=$tmp/ruleset.json
   dump_ruleset "$ruleset"
   if firewall_conflict "$ruleset"; then
-    if [ "${REPLACE_FIREWALL:-}" != "1" ]; then
-      printf '%s\n' "检测到 ufw、firewalld、已启用的 nftables，或其他 input drop 链。" >&2
-      printf '%s\n' "要关掉 ufw / firewalld 并停用系统 nftables 服务，请加 REPLACE_FIREWALL=1。" >&2
-      exit 1
+    if [ "$clean_now" -eq 1 ] || ask_clean; then
+      clean_now=1
+      printf '%s\n' "将在加载规则前停用现有防火墙。"
+    else
+      clean_now=0
+      printf '%s\n' "保留已有防火墙，只更新 shadownft 自己的规则。"
     fi
-    printf '%s\n' "将在加载规则前停用现有防火墙。"
   fi
 
   "$PYTHON" "$PY" --resolve-settings >"$tmp/resolved.json"
@@ -336,6 +389,10 @@ PY
   . "$tmp/resolved.env"
 
   detect_ssh_port
+  if [ -z "${ALLOW_PORTS:-}" ]; then
+    ALLOW_PORTS="${SSH_PORT},80,443"
+  fi
+  ALLOW_PORTS=$("$PYTHON" "$PY" --normalize-allow-ports | tr -d '[:space:]')
   ports=$("$PYTHON" "$PY" --choose-ports)
   SS_PORT=$(printf '%s\n' "$ports" | awk 'NR==1 {print; exit}')
   PORT_A=$(printf '%s\n' "$ports" | awk 'NR==2 {print; exit}')
@@ -359,12 +416,20 @@ PY
   fi
 
   ensure_user
+  chown root:shadowsocks "$SS_DIR"
+  chmod 750 "$SS_DIR"
   "$PYTHON" "$PY" --write-env "$CONFIG_ENV"
   "$PYTHON" "$PY" --render-nft >"$NFT_FILE"
-  chmod 644 "$NFT_FILE"
+  "$PYTHON" "$PY" --render-rules >"$NFT_RULES"
+  chmod 644 "$NFT_FILE" "$NFT_RULES"
   "$PYTHON" "$PY" --write-ss-config "$SS_CONFIG"
   chown root:shadowsocks "$SS_CONFIG"
   chmod 640 "$SS_CONFIG"
+  if command -v su >/dev/null 2>&1; then
+    if ! su -s /bin/sh shadowsocks -c "test -r '$SS_CONFIG'"; then
+      die "shadowsocks 用户读不到 $SS_CONFIG"
+    fi
+  fi
   "$PYTHON" "$PY" --write-client "$CLIENT_TXT" >"$tmp/client.txt"
   chmod 600 "$CONFIG_ENV" "$CLIENT_TXT"
 
@@ -417,22 +482,13 @@ EOF
   systemctl daemon-reload
   systemctl enable shadowsocks-rust
   systemctl enable shadownft
-  if [ ! -f "$CONFIRMED" ]; then
-    arm_rollback
-    armed=1
-  fi
 
   dump_ruleset "$ruleset"
-  if firewall_conflict "$ruleset"; then
-    if [ "${REPLACE_FIREWALL:-}" != "1" ]; then
-      die "加载前又检测到其他防火墙。没有修改防火墙。"
-    fi
+  if [ "$clean_now" -eq 1 ] && firewall_conflict "$ruleset"; then
     disable_other_firewalls
     dump_ruleset "$ruleset"
     if ! "$PYTHON" "$PY" --check-firewall "$ruleset"; then
-      printf '%s\n' "停掉 ufw / firewalld / nftables 之后，仍有其他 input drop 链。shadownft 没有加载。" >&2
-      printf '%s\n' "如果刚才关掉了 ufw，需要的话再执行 ufw enable。" >&2
-      exit 1
+      printf '%s\n' "停掉 ufw / firewalld / nftables 之后，仍有其他 input drop 链。shadownft 仍会加载自己的规则。" >&2
     fi
   fi
 
@@ -454,16 +510,17 @@ EOF
 
   printf '\n'
   cat "$CLIENT_TXT"
-  if [ "$armed" -eq 1 ]; then
-    printf '%s\n' "60 秒内执行: $BIN confirm"
-    printf '%s\n' "超时未确认会删除 shadownft 防火墙，并停止这两个服务。"
+  printf '%s\n' "额外放行端口: ${ALLOW_PORTS}"
+  if [ "$clean_now" -eq 1 ]; then
+    printf '%s\n' "已按确认关闭 ufw、firewalld 和系统 nftables 服务。"
   else
-    printf '%s\n' "已有确认标记，这次没有启动 60 秒回滚。"
+    printf '%s\n' "没有清理已有防火墙。下次要清理时执行: confirm=yes $BIN"
   fi
 }
 
 main() {
   local cmd=${1:-install}
+  maybe_reexec "$@"
   case "$cmd" in
     -h|--help|help)
       usage

@@ -1,25 +1,31 @@
 在 Linux 服务器上安装 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)，并用 nftables 做敲门加白。
 
-端口 B 跑 Shadowsocks。端口 A 不监听任何程序，只记录谁发过包。来源地址会拿去查 ip-api，属于重庆，或者 `mobile` 为 true，才把这个 IPv4 以 /32 放进白名单。白名单最多留最新 100 条。公网访问端口 B 必须先在白名单里。内网、SSH、已经建立的连接不需要敲门。
+端口 B 跑 Shadowsocks。端口 A 不监听任何程序，只记录谁发过包。来源地址会拿去查 ip-api，属于重庆，或者 `mobile` 为 true，才把这个 IPv4 以 /32 放进白名单。白名单最多留最新 100 条。公网访问端口 B 必须先在白名单里。内网、已经建立的连接，以及额外放行端口不需要敲门。额外放行端口默认是这台机器的 SSH 端口、80 和 443，和端口 A、端口 B 无关。
 
 ## 服务器要求
 
-- x86_64 或 aarch64
+- Linux，x86_64 或 aarch64
 - systemd
 - root
 - apt 或 dnf
 - 能访问 GitHub，以及 `http://ip-api.com`
-- 云厂商安全组放行 SSH，再放行端口 A 和端口 B 的 TCP、UDP
-
-本机是 macOS 时只能检查脚本，不能在这里加载 nftables。安装要在服务器上执行。
+- 云厂商安全组放行 SSH、80、443，再放行端口 A 和端口 B 的 TCP、UDP
 
 ## 部署
 
-把仓库放到服务器上，执行：
+在服务器上执行：
 
 ```bash
-sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | bash
 ```
+
+要在安装时关掉 ufw、firewalld 和系统自带的 nftables 服务，执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | confirm=yes bash
+```
+
+没有加 `confirm=yes` 时，如果发现这些防火墙，脚本会在终端问一句。输入 `y` 才清理，直接回车就保留。重复执行不会删掉已经写入的白名单，也不会重抽已有的端口和密码。
 
 安装过程会：
 
@@ -28,14 +34,6 @@ sudo ./install.sh
 3. 没有指定密码时，用 `ssservice genkey` 生成密钥
 4. 没有指定端口时，端口 B 在 10000–20000 之间随机，端口 A 是端口 B 加上 1 到 1000 的随机数
 5. 写入 nftables 表 `inet shadownft`，并启动 `shadowsocks-rust`、`shadownft` 两个服务
-
-第一次加载防火墙后有 60 秒回滚。现有 SSH 会话会保持。看到下面这句时，在同一个会话里执行：
-
-```bash
-sudo /usr/local/sbin/shadownft confirm
-```
-
-60 秒内没有确认，脚本会删掉 `inet shadownft`，并停止这两个服务。已经确认过的机器再次安装，不会再倒计时。
 
 装完后的连接信息在终端里，也写在 `/etc/shadownft/client.txt`，权限 600：
 
@@ -74,10 +72,10 @@ ip-api 在中文结果里把重庆标成 region `CQ`、地区名「重庆市」�
 
 ## 变量
 
-变量写在安装命令前面。`/etc/shadownft/config.env` 里已有的值会保留；这次命令里写出来的同名变量覆盖它们。
+变量写在 `bash` 前面。`/etc/shadownft/config.env` 里已有的值会保留；这次命令里显式传入的同名变量覆盖它们。
 
 ```bash
-sudo SS_PORT=18000 SSH_PORT=22 PUBLIC_IP=203.0.113.10 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | SS_PORT=18000 PUBLIC_IP=203.0.113.10 bash
 ```
 
 | 变量 | 默认 | 作用 |
@@ -91,7 +89,8 @@ sudo SS_PORT=18000 SSH_PORT=22 PUBLIC_IP=203.0.113.10 ./install.sh
 | `SS_BIND` | `0.0.0.0` | Shadowsocks 监听地址 |
 | `SS_MODE` | `tcp_and_udp` | 也可设 `tcp_only` 或 `udp_only` |
 | `SS_VERSION` | 空则装当前最新 release，并记入配置 | `latest` 强制重新取最新版 |
-| `SSH_PORT` | 读 `sshd -T`，否则 `22` | 防火墙放行的 SSH 端口 |
+| `SSH_PORT` | 读 `sshd -T`，否则 `22` | 用来避开端口 A、B，并作为默认额外放行端口之一 |
+| `ALLOW_PORTS` | SSH 端口、`80`、`443` | 这些 TCP 端口对所有来源放行，逗号分隔。和敲门、白名单无关 |
 | `PUBLIC_IP` | 向 ip-api 查询 | 写进连接信息 |
 | `INTRANET_V4` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8` | 直接放行的 IPv4 |
 | `INTRANET_V6` | `::1,fc00::/7,fe80::/10` | 直接放行的 IPv6 |
@@ -105,20 +104,20 @@ sudo SS_PORT=18000 SSH_PORT=22 PUBLIC_IP=203.0.113.10 ./install.sh
 | `KNOCK_COOLDOWN` | `600` | 不匹配的地址多少秒内不再查询 |
 | `NEGATIVE_TTL` | `600` | 查询失败后的冷却秒数 |
 | `QUEUE_MAX` | `50` | 排队中的敲门上限，满了就丢掉新的 |
-| `REPLACE_FIREWALL` | 空 | 设为 `1` 才关闭 ufw、firewalld，并停用系统 `nftables` 服务 |
+| `confirm` | 空 | 设为 `yes` 时关闭 ufw、firewalld，并停用系统 `nftables` 服务。不设时如果发现这些防火墙，会询问；输入 `y` 才清理 |
 
-服务器上如果 ufw 或 firewalld 正在运行，系统 `nftables` 服务已启用，或者另有一条 input 链的策略是 drop，安装会停下来。确认要改掉它们时：
+服务器上如果 ufw 或 firewalld 正在运行，或者系统 `nftables` 服务已启用，安装仍会继续。默认不清理它们。要清理时：
 
 ```bash
-sudo REPLACE_FIREWALL=1 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | confirm=yes bash
 ```
 
-停用之后如果还有别的 input drop 链，安装会中止，并且不会自动把 ufw 打开。
+`REPLACE_FIREWALL=1` 同样表示清理。清理后如果还剩别的 input drop 链，脚本会打印链名并继续加载自己的规则，不会自动把 ufw 打开。
 
 命令行里传入的密码会出现在 shell 历史里。轮换密码用：
 
 ```bash
-sudo SS_PASSWORD=generate ./install.sh
+curl -fsSL https://raw.githubusercontent.com/azoway/shadownft/main/install.sh | SS_PASSWORD=generate bash
 ```
 
 ## 回滚
@@ -126,7 +125,7 @@ sudo SS_PASSWORD=generate ./install.sh
 手动撤掉这次加上的防火墙和服务，程序和配置还留着：
 
 ```bash
-sudo /usr/local/sbin/shadownft rollback
+/usr/local/sbin/shadownft rollback
 ```
 
 这会停止并禁用 `shadowsocks-rust` 和 `shadownft`，删除 `inet shadownft`，并清掉确认标记。白名单文件 `/var/lib/shadownft/whitelist.order` 还在。下次安装会把它填回去。
@@ -134,7 +133,7 @@ sudo /usr/local/sbin/shadownft rollback
 ## 卸载
 
 ```bash
-sudo /usr/local/sbin/shadownft uninstall
+/usr/local/sbin/shadownft uninstall
 ```
 
 会删掉：
